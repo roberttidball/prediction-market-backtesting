@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import os
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -152,10 +153,9 @@ def _format_path(path_template, kwargs):
 
 
 def _payload_rows(payload):
+    payload = _check_payload(payload)
     if isinstance(payload, list):
         return payload
-    if not isinstance(payload, dict):
-        return []
     data = payload.get("data")
     if isinstance(data, list):
         return data
@@ -201,13 +201,11 @@ def _frame_from_payload(payload, limit=None, index=True):
 
 
 def _check_payload(payload):
-    """Raise a clean error for an error body or an unexpected JSON shape."""
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict) and ("data" in payload or "detail" not in payload):
-        return payload
-    detail = payload["detail"] if isinstance(payload, dict) else "unexpected response shape"
-    raise ValueError(f"FXMacroData returned an error: {detail}")
+    if not isinstance(payload, (dict, list)):
+        raise ValueError("FXMacroData returned an invalid response")
+    if isinstance(payload, dict) and ("detail" in payload or "error" in payload):
+        raise ValueError("FXMacroData returned an error response")
+    return payload
 
 
 def _filter_market_tier(frame, min_tier):
@@ -235,8 +233,14 @@ class FXMacroDataClient:
             # Unredirected headers are not copied onto a redirected request,
             # so the key is never forwarded to another host.
             request.add_unredirected_header("X-API-Key", self.api_key)
-        with urlopen(request, timeout=self.timeout) as response:  # nosec B310
-            return json.loads(response.read().decode("utf-8"))
+        try:
+            with urlopen(request, timeout=self.timeout) as response:  # nosec B310
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.URLError:
+            raise urllib.error.URLError("FXMacroData request failed") from None
+        except (ValueError, UnicodeError):
+            raise ValueError("FXMacroData returned invalid JSON") from None
+        return payload
 
     def fetch_dataset(self, dataset, **kwargs):
         dataset = _dataset_name(dataset)
@@ -344,7 +348,9 @@ class FXMacroDataClient:
                 page_size = min(page_size, limit - len(rows))
             payload = self.fetch_dataset(dataset, limit=page_size, offset=offset, **kwargs)
             page = payload.get("data") if isinstance(payload, dict) else payload
-            if not isinstance(page, list) or not page:
+            if not isinstance(page, list):
+                raise ValueError("FXMacroData returned an invalid paginated response")
+            if not page:
                 break
             rows.extend(page)
             if limit is not None and len(rows) >= limit:
